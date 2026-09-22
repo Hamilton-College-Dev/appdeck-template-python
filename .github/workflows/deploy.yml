@@ -34,7 +34,26 @@ jobs:
       - name: Get the code
         uses: actions/checkout@v5
 
+      # The templates are repos too, and they will never have the project
+      # settings below. Detect that, so a push to the template builds and
+      # tests itself (useful) instead of failing a deploy it cannot do.
+      - name: Work out whether this is the template or a real project
+        id: mode
+        run: |
+          set -euo pipefail
+          name="${GITHUB_REPOSITORY##*/}"
+          case "$name" in
+            appdeck-template-*)
+              echo "template=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::This is the AppDeck template repository. Building and testing only, nothing is deployed."
+              ;;
+            *)
+              echo "template=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
       - name: Check the settings are present
+        if: steps.mode.outputs.template != 'true'
         env:
           AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           AWS_REGION: ${{ vars.AWS_REGION }}
@@ -95,16 +114,19 @@ jobs:
           exit 1
 
       - name: Sign in to the hosting platform
+        if: steps.mode.outputs.template != 'true'
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Sign in to the image registry
+        if: steps.mode.outputs.template != 'true'
         id: registry
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Push the image
+        if: steps.mode.outputs.template != 'true'
         id: image
         env:
           REGISTRY: ${{ steps.registry.outputs.registry }}
@@ -125,6 +147,7 @@ jobs:
       # misconfigured service name fails the deploy rather than quietly
       # standing up a second copy of your site.
       - name: Deploy
+        if: steps.mode.outputs.template != 'true'
         uses: aws-actions/amazon-ecs-deploy-express-service@v1
         with:
           service-name: ${{ vars.ECS_SERVICE }}
@@ -136,4 +159,5 @@ jobs:
           health-check-path: /healthz
 
       - name: Done
+        if: steps.mode.outputs.template != 'true'
         run: echo "Deployed ${{ github.sha }}. Give it a minute, then reload your site."
