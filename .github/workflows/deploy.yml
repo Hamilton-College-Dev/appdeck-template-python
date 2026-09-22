@@ -1,0 +1,139 @@
+# Deploys your app every time you push to main.
+#
+# You do not need an AWS account and you will not be given one. This workflow
+# signs in to the hosting platform using a short-lived token that GitHub mints
+# for this repository (OIDC). There are no access keys here, and there should
+# never be any. If you find yourself adding AWS_ACCESS_KEY_ID to this file,
+# stop and ask the web team.
+#
+# The settings it reads (the "vars" below) were filled in for you when this
+# repository was created. Don't hard-code them.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # lets you re-run a deploy by hand from the Actions tab
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # required to get the sign-in token. Removing this breaks deploys.
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v5
+
+      - name: Check the settings are present
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+          ECS_EXECUTION_ROLE_ARN: ${{ vars.ECS_EXECUTION_ROLE_ARN }}
+          ECS_INFRASTRUCTURE_ROLE_ARN: ${{ vars.ECS_INFRASTRUCTURE_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in AWS_DEPLOY_ROLE_ARN AWS_REGION ECR_REPOSITORY ECS_SERVICE \
+                      ECS_EXECUTION_ROLE_ARN ECS_INFRASTRUCTURE_ROLE_ARN; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::This repository is missing settings:$missing"
+            echo "These are set for you when the project is created."
+            echo "Ask the web team rather than filling them in yourself."
+            exit 1
+          fi
+          echo "All settings present."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build the image
+        run: docker build -t app:ci .
+
+      # Catches the most common deploy failure (app doesn't start, or doesn't
+      # answer /healthz) here, in 30 seconds, instead of out on the platform.
+      - name: Check it starts and answers /healthz
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 8080:8080 app:ci
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://localhost:8080/healthz; then
+              echo
+              echo "Health check passed."
+              docker rm -f smoke >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::The app never answered /healthz on port 8080."
+          echo "----- container logs -----"
+          docker logs smoke || true
+          docker rm -f smoke >/dev/null || true
+          exit 1
+
+      - name: Sign in to the hosting platform
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Sign in to the image registry
+        id: registry
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push the image
+        id: image
+        env:
+          REGISTRY: ${{ steps.registry.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker tag app:ci "$REGISTRY/$REPOSITORY:$TAG"
+          docker tag app:ci "$REGISTRY/$REPOSITORY:latest"
+          docker push "$REGISTRY/$REPOSITORY:$TAG"
+          docker push "$REGISTRY/$REPOSITORY:latest"
+          echo "uri=$REGISTRY/$REPOSITORY:$TAG" >> "$GITHUB_OUTPUT"
+
+      # Updates the service that already exists for this project.
+      #
+      # This workflow never creates a service. Creating one is the platform's
+      # job, and the sign-in role used here is denied permission to do it, so a
+      # misconfigured service name fails the deploy rather than quietly
+      # standing up a second copy of your site.
+      - name: Deploy
+        uses: aws-actions/amazon-ecs-deploy-express-service@v1
+        with:
+          service-name: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER || 'default' }}
+          image: ${{ steps.image.outputs.uri }}
+          execution-role-arn: ${{ vars.ECS_EXECUTION_ROLE_ARN }}
+          infrastructure-role-arn: ${{ vars.ECS_INFRASTRUCTURE_ROLE_ARN }}
+          container-port: 8080
+          health-check-path: /healthz
+
+      - name: Done
+        run: echo "Deployed ${{ github.sha }}. Give it a minute, then reload your site."

@@ -1,0 +1,7 @@
+# Production dependencies. Keep this list short: the app runs in 512 MB.
+#
+# gunicorn  - the web server that runs the app in production
+# psycopg   - the PostgreSQL driver, used only when DATABASE_URL is set
+#             ([binary] needs no compiler, [pool] adds connection pooling)
+gunicorn==23.0.0
+psycopg[binary,pool]==3.2.10
